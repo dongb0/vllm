@@ -239,6 +239,9 @@ class MooncakeConnector(KVConnectorBase_V1):
         **kwargs,
     ) -> None:
         """MooncakeConnector does not save explicitly."""
+        # TODO: mooncake impl layer wise transfer
+        # 1. check whether we receive D's addr and blocks addr
+        # 2. if so, send to D; else wait for D's msg
         pass
 
     def wait_for_save(self):
@@ -1062,7 +1065,7 @@ class MooncakeConnectorWorker:
             "Sending kv transfer request for %s on path: %s", req_ids, worker_addr
         )
 
-        # Send query for the request.
+        # Send query for the request. # TODO wdb: when all the layer kv cache is calculated, send zmq msg to trigger kvcache transfer; we send it earlier for layer-wise transfer
         try:
             with make_zmq_socket(
                 self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
@@ -1188,7 +1191,7 @@ class MooncakeConnectorWorker:
         self.receive_kv(remote_engine_id, pull_metas)
 
     async def _start_load_kv(
-        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
+        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] # TODO wdb: call it after each layer forward
     ):
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
@@ -1198,7 +1201,7 @@ class MooncakeConnectorWorker:
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
 
-    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata): # TODO: 原本所有的kvlayer信息都存放在这里了？
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
