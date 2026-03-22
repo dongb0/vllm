@@ -343,6 +343,7 @@ class MooncakeConnectorScheduler:
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
+        self.engine_id = engine_id
 
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
@@ -1605,7 +1606,7 @@ class MooncakeConnectorWorker:
             )
 
     async def _connect_to_prefiller_bootstrap(self, remote_bootstrap_addr: str):
-        url = remote_bootstrap_addr + "/query"
+        url = f"http://{remote_bootstrap_addr}/query"
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(url)
@@ -1676,7 +1677,7 @@ class MooncakeConnectorWorker:
 
         self.receive_kv(remote_engine_id, pull_metas)
 
-    async def _start_load_kv(
+    async def _start_load_kv( # TODO wdb: 我想统计一下计算和通信在重叠之后传输时间减少了多少；怎么统计？
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] # TODO wdb: call it after each layer forward
     ):
         # For layer-wise mode, also save the reqs_to_recv to self for notification tracking
