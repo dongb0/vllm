@@ -137,6 +137,8 @@ class SendBlockMeta:
     remote_port: int = 0
     remote_kv_caches_base_addr: list[int] = field(default_factory=list)
     remote_notify_port: int = 0  # D side notification port for layer-wise mode
+    remote_block_ids: list[int] = field(default_factory=list)  # Consumer's block IDs
+    address_ready: asyncio.Event = field(default_factory=asyncio.Event)  # Signals D address info is present
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -597,6 +599,7 @@ class MooncakeConnectorWorker:
                 target=_async_loop, args=(self.sender_loop,), daemon=True
             )
             self._sender_listener_t.start()
+            self._notify_socks: dict[str, zmq.asyncio.Socket] = {}
 
             # Start bootstrap server on global rank 0.
             if should_launch_bootstrap_server(vllm_config):
@@ -743,6 +746,9 @@ class MooncakeConnectorWorker:
                 # The notification listener uses ZMQ, which will be terminated
                 # by async_zmq_ctx.term() above, causing the listener to exit.
                 self._layer_notify_t.join(timeout=1.0)
+            if hasattr(self, '_notify_socks'):
+                for sock in self._notify_socks.values():
+                    sock.close()
 
     async def register_worker_with_bootstrap(self):
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
@@ -867,7 +873,9 @@ class MooncakeConnectorWorker:
                         remote_notify_port=meta.notify_port,
                         total_layers=meta.total_layers,
                         layer_progress={ln: False for ln in meta.layer_names},
+                        remote_block_ids=meta.req_blocks[d_req_id][1],
                     )
+                    self.reqs_need_send[transfer_id].address_ready.set()
                     logger.debug(
                         "Layer-wise mode: Created send_meta for transfer_id %s "
                         "with %d layers", transfer_id, meta.total_layers
@@ -893,6 +901,8 @@ class MooncakeConnectorWorker:
                         send_meta.remote_notify_port = meta.notify_port
                         send_meta.total_layers = meta.total_layers
                         send_meta.layer_progress = {ln: False for ln in meta.layer_names}
+                        send_meta.remote_block_ids = meta.req_blocks[d_req_id][1]
+                        send_meta.address_ready.set()
                         logger.debug(
                             "Layer-wise mode: Updated send_meta for transfer_id %s "
                             "with %d layers", transfer_id, meta.total_layers
@@ -955,6 +965,16 @@ class MooncakeConnectorWorker:
                     logger.warning(
                         "Request %s expired before sending on P side.", d_req_id
                     )
+
+            # If layer-wise mode is active, we don't perform bulk transfer in ZMQ loop.
+            # Instead, each layer is pushed as soon as it's saved.
+            if meta.total_layers > 0:
+                response = MooncakeXferResponse(
+                    status=response_status,
+                    ok_reqs=[d_req_id for d_req_id, _ in ready_reqs],
+                )
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+                continue
 
             src_ptrs, dst_ptrs, lengths, err_reqs = await self._build_transfer_params(
                 ready_reqs, meta
@@ -1147,13 +1167,17 @@ class MooncakeConnectorWorker:
         if send_meta.remote_notify_port > 0:
             try:
                 notify_addr = f"tcp://{send_meta.remote_hostname}:{send_meta.remote_notify_port}"
-                notify_sock = self.async_zmq_ctx.socket(zmq.PUSH)
-                notify_sock.connect(notify_addr)
-                notify_sock.send_json({
+                if notify_addr not in self._notify_socks:
+                    notify_sock = self.async_zmq_ctx.socket(zmq.PUSH)
+                    notify_sock.connect(notify_addr)
+                    self._notify_socks[notify_addr] = notify_sock
+                else:
+                    notify_sock = self._notify_socks[notify_addr]
+
+                await notify_sock.send_json({
                     "transfer_id": send_meta.transfer_id,
                     "layer_name": layer_name,
                 })
-                notify_sock.close()
                 logger.debug(
                     "Sent layer completion notification for %s to %s",
                     layer_name, notify_addr
@@ -1219,27 +1243,24 @@ class MooncakeConnectorWorker:
             logger.error("No remote base address for layer %d", layer_idx)
             return src_ptrs, dst_ptrs, lengths
 
+        remote_block_ids = send_meta.remote_block_ids
+        if len(block_ids) != len(remote_block_ids):
+            logger.error("Local block count (%d) doesn't match remote block count (%d)", 
+                         len(block_ids), len(remote_block_ids))
+            return src_ptrs, dst_ptrs, lengths
+
         block_len = self.block_len
 
-        # Group contiguous blocks
-        group_local_block_ids = []
-        if len(block_ids) > 0:
-            start = block_ids[0]
-            curr_group = [start]
-            for i in range(1, len(block_ids)):
-                if block_ids[i] == block_ids[i-1] + 1:
-                    curr_group.append(block_ids[i])
-                else:
-                    group_local_block_ids.append(curr_group)
-                    curr_group = [block_ids[i]]
-            group_local_block_ids.append(curr_group)
+        # For layer-wise transfer, we must use both local and remote block IDs
+        group_local_block_ids, group_remote_block_ids = group_concurrent_contiguous(
+            block_ids, remote_block_ids
+        )
 
-        # For layer-wise transfer, remote and local block IDs are the same
-        for group in group_local_block_ids:
+        for src_group, dst_group in zip(group_local_block_ids, group_remote_block_ids):
             for local_layer_addr, remote_layer_addr in zip(local_base_addr, remote_base_addr):
-                src_ptrs.append(local_layer_addr + group[0] * block_len)
-                dst_ptrs.append(remote_layer_addr + group[0] * block_len)
-                lengths.append(block_len * len(group))
+                src_ptrs.append(local_layer_addr + src_group[0] * block_len)
+                dst_ptrs.append(remote_layer_addr + dst_group[0] * block_len)
+                lengths.append(block_len * len(src_group))
 
         return src_ptrs, dst_ptrs, lengths
 
@@ -1439,7 +1460,7 @@ class MooncakeConnectorWorker:
                     notify_port = getattr(self, 'layer_notify_port', 0)
                     if notify_port > 0:
                         break
-                    time.sleep(0.01)
+                    await asyncio.sleep(0.01)
 
             meta_kwargs["notify_port"] = notify_port
 
@@ -1651,15 +1672,15 @@ class MooncakeConnectorWorker:
 
             send_meta = self.reqs_need_send[transfer_id]
 
-            # 1. Wait for D side ready (first time needs to wait for ZMQ handshake)
-            if not send_meta.ready.is_set():
+            # 1. Wait for D side address info to be ready
+            if not send_meta.address_ready.is_set():
                 try:
                     await asyncio.wait_for(
-                        send_meta.ready.wait(),
+                        send_meta.address_ready.wait(),
                         timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for D side ready for req %s", req_id)
+                    logger.warning("Timeout waiting for D side address ready for req %s", req_id)
                     continue
 
             # 2. Check if this layer already sent (idempotency)
