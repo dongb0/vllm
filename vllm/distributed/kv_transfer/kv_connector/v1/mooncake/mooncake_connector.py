@@ -76,6 +76,10 @@ class MooncakeXferMetadata(
     remote_tp_rank: int
     req_blocks: dict[ReqId, tuple[TransferId, list[int]]]
     kv_caches_base_addr: list[int]
+    # ===== Layer-wise transfer fields =====
+    total_layers: int = 0  # Total number of layers for layer-wise transfer
+    layer_names: list[str] = field(default_factory=list)  # Layer names in order
+    notify_port: int = 0  # Consumer's notification port for layer completion
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -108,6 +112,11 @@ class PullReqMeta:
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P
     pull_tasks_count: int = 0
+    # ===== Layer-wise transfer fields (Consumer side) =====
+    layer_progress: dict[str, bool] = field(default_factory=dict)  # Per-layer receive status
+    total_layers: int = 0
+    completed_layers: int = 0
+    layer_events: dict[str, asyncio.Event] = field(default_factory=dict)  # Per-layer completion events
 
 
 @dataclass
@@ -120,6 +129,14 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    # ===== Layer-wise transfer fields (Producer side) =====
+    layer_progress: dict[str, bool] = field(default_factory=dict)  # Per-layer send status
+    total_layers: int = 0
+    completed_layers: int = 0
+    remote_hostname: str = ""  # D side address (obtained from start_load_kv)
+    remote_port: int = 0
+    remote_kv_caches_base_addr: list[int] = field(default_factory=list)
+    remote_notify_port: int = 0  # D side notification port for layer-wise mode
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -164,6 +181,13 @@ class MooncakeConnector(KVConnectorBase_V1):
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
+        # Layer-wise transfer mode configuration
+        self.layer_wise_mode = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "layer_wise", False # TODO: 我觉得应该默认打开；没必要用这个配置
+        )
+        if self.layer_wise_mode:
+            logger.info("MooncakeConnector: Layer-wise transfer mode enabled")
+
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MooncakeConnectorScheduler | None = (
                 MooncakeConnectorScheduler(vllm_config, self.engine_id)
@@ -171,7 +195,9 @@ class MooncakeConnector(KVConnectorBase_V1):
             self.connector_worker: MooncakeConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = MooncakeConnectorWorker(vllm_config, self.engine_id)
+            self.connector_worker = MooncakeConnectorWorker(
+                vllm_config, self.engine_id, self.layer_wise_mode
+            )
 
     ############################################################
     # Scheduler Side Methods
@@ -228,8 +254,31 @@ class MooncakeConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """MooncakeConnector does not do layerwise saving."""
-        pass
+        """
+        Consumer side: Wait for specified layer's KV transfer to complete.
+        Called within attention layer to ensure this layer's KV is ready.
+
+        Push mode:
+        - D passively receives data sent by P
+        - Background thread updates layer_progress
+        - This function checks and waits for this layer to complete
+        """
+        if not self.layer_wise_mode:
+            # Old mode: no operation (bulk transfer done in start_load_kv)
+            return
+
+        assert self.connector_worker is not None
+
+        # Only consumer waits for layer load
+        if self.connector_worker.is_kv_producer:
+            return
+
+        # Synchronously wait for this layer to complete
+        future = asyncio.run_coroutine_threadsafe(
+            self.connector_worker.wait_for_layer_load_async(layer_name),
+            self.connector_worker.receiver_loop
+        )
+        future.result()  # Block until this layer completes
 
     def save_kv_layer(
         self,
@@ -238,11 +287,33 @@ class MooncakeConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> None:
-        """MooncakeConnector does not save explicitly."""
-        # TODO: mooncake impl layer wise transfer
-        # 1. check whether we receive D's addr and blocks addr
-        # 2. if so, send to D; else wait for D's msg
-        pass
+        """
+        Layer-wise KV transfer implementation (Push mode).
+        Called after each layer's forward pass on Producer side.
+
+        Args:
+            layer_name: Name of the layer (e.g., "layer_0")
+            kv_layer: The KV cache tensor for this layer
+            attn_metadata: Attention metadata
+        """
+        if not self.layer_wise_mode:
+            # Old mode: do nothing, wait for request_finished to send all at once
+            return
+
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
+
+        # Only producer saves and sends KV
+        if self.connector_worker.is_kv_consumer:
+            return
+
+        # Submit to worker's sender_loop
+        asyncio.run_coroutine_threadsafe(
+            self.connector_worker.save_kv_layer_async(
+                self._connector_metadata, layer_name, kv_layer, attn_metadata
+            ),
+            self.connector_worker.sender_loop
+        )
 
     def wait_for_save(self):
         pass
@@ -447,10 +518,11 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str, layer_wise_mode: bool = False):
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
+        self.layer_wise_mode = layer_wise_mode
 
         self.engine = TransferEngine()
         self.hostname = get_ip()
@@ -542,6 +614,15 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.start()
             logger.debug("Mooncake Decoder: start receiver thread")
 
+            # For layer-wise mode, start a notification listener
+            if self.layer_wise_mode:
+                self._layer_notify_t = threading.Thread(
+                    target=self._layer_notification_listener,
+                    daemon=True,
+                )
+                self._layer_notify_t.start()
+                logger.debug("Mooncake Decoder: start layer notification listener")
+
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
 
@@ -578,6 +659,71 @@ class MooncakeConnectorWorker:
     def __del__(self):
         self.shutdown()
 
+    def _layer_notification_listener(self):
+        """
+        Background thread on Consumer side to listen for layer completion notifications.
+        Producer sends a notification via ZMQ after each layer is transferred.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._layer_notification_loop())
+
+    async def _layer_notification_loop(self):
+        """
+        Async loop for layer notification listener.
+        """
+        sock = self.async_zmq_ctx.socket(zmq.PULL)
+        self.layer_notify_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
+        logger.info(
+            "Mooncake layer notification listener started on %s:%d",
+            self.hostname, self.layer_notify_port
+        )
+
+        try:
+            while True:
+                msg = await sock.recv_json()
+                transfer_id = msg.get("transfer_id")
+                layer_name = msg.get("layer_name")
+
+                if transfer_id and layer_name:
+                    # Find the corresponding pull_meta and mark layer as received
+                    found = False
+                    for pull_metas in self.reqs_to_recv.values():
+                        for req_id, pull_meta in pull_metas.items():
+                            if pull_meta.transfer_id == transfer_id:
+                                if layer_name not in pull_meta.layer_progress:
+                                    pull_meta.layer_progress[layer_name] = True
+                                    pull_meta.completed_layers += 1
+
+                                    # Signal waiting coroutines
+                                    if layer_name in pull_meta.layer_events:
+                                        pull_meta.layer_events[layer_name].set()
+
+                                    logger.debug(
+                                        "Layer %s received for req %s (%d/%d)",
+                                        layer_name, req_id,
+                                        pull_meta.completed_layers,
+                                        pull_meta.total_layers
+                                    )
+
+                                    # Check if all layers completed
+                                    if pull_meta.completed_layers >= pull_meta.total_layers:
+                                        self.finished_recving_reqs.add(pull_meta.d_req_id)
+                                        logger.info(
+                                            "Finished receiving all layers for req %s",
+                                            req_id
+                                        )
+                                found = True
+                                break
+                        if found:
+                            break
+        except zmq.ContextTerminated:
+            logger.debug("ZMQ context terminated, exiting layer notification listener.")
+        except Exception as e:
+            logger.error("Error in layer notification listener: %s", e)
+        finally:
+            sock.close()
+
     def shutdown(self):
         """Cleanup background threads on destruction."""
         self.async_zmq_ctx.term()
@@ -588,9 +734,15 @@ class MooncakeConnectorWorker:
                 self._sender_listener_t.join()
             if should_launch_bootstrap_server(self.vllm_config):
                 self.bootstrap_server.shutdown()
-        if not self.is_kv_producer and self.receiver_loop.is_running():
-            self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
-            self._mooncake_receiver_t.join()
+        if not self.is_kv_producer:
+            if self.receiver_loop.is_running():
+                self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
+                self._mooncake_receiver_t.join()
+            # Stop layer notification listener if running
+            if self.layer_wise_mode and hasattr(self, '_layer_notify_t'):
+                # The notification listener uses ZMQ, which will be terminated
+                # by async_zmq_ctx.term() above, causing the listener to exit.
+                self._layer_notify_t.join(timeout=1.0)
 
     async def register_worker_with_bootstrap(self):
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
@@ -701,12 +853,50 @@ class MooncakeConnectorWorker:
         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
             if transfer_id not in self.reqs_need_send:
                 # This req is not enqueued in P side yet, create it here.
-                self.reqs_need_send[transfer_id] = SendBlockMeta(
-                    p_req_id="",
-                    transfer_id=transfer_id,
-                    local_block_ids=[],
-                    ready=asyncio.Event(),
-                )
+                # For layer-wise mode, also save D's address info
+                if meta.total_layers > 0 and meta.layer_names:
+                    # Layer-wise mode: initialize with layer tracking
+                    self.reqs_need_send[transfer_id] = SendBlockMeta(
+                        p_req_id="",
+                        transfer_id=transfer_id,
+                        local_block_ids=[],
+                        ready=asyncio.Event(),
+                        remote_hostname=meta.remote_hostname,
+                        remote_port=meta.remote_port,
+                        remote_kv_caches_base_addr=meta.kv_caches_base_addr,
+                        remote_notify_port=meta.notify_port,
+                        total_layers=meta.total_layers,
+                        layer_progress={ln: False for ln in meta.layer_names},
+                    )
+                    logger.debug(
+                        "Layer-wise mode: Created send_meta for transfer_id %s "
+                        "with %d layers", transfer_id, meta.total_layers
+                    )
+                else:
+                    # Old mode: bulk transfer
+                    self.reqs_need_send[transfer_id] = SendBlockMeta(
+                        p_req_id="",
+                        transfer_id=transfer_id,
+                        local_block_ids=[],
+                        ready=asyncio.Event(),
+                    )
+            else:
+                # Request already exists (may have been created by record_send_reqs)
+                # For layer-wise mode, update with layer tracking info from D
+                send_meta = self.reqs_need_send[transfer_id]
+                if meta.total_layers > 0 and meta.layer_names:
+                    if send_meta.total_layers == 0:
+                        # Update with layer tracking info
+                        send_meta.remote_hostname = meta.remote_hostname
+                        send_meta.remote_port = meta.remote_port
+                        send_meta.remote_kv_caches_base_addr = meta.kv_caches_base_addr
+                        send_meta.remote_notify_port = meta.notify_port
+                        send_meta.total_layers = meta.total_layers
+                        send_meta.layer_progress = {ln: False for ln in meta.layer_names}
+                        logger.debug(
+                            "Layer-wise mode: Updated send_meta for transfer_id %s "
+                            "with %d layers", transfer_id, meta.total_layers
+                        )
             send_meta = self.reqs_need_send[transfer_id]
             pending_reqs[d_req_id] = send_meta
 
@@ -893,6 +1083,87 @@ class MooncakeConnectorWorker:
 
         return src_ptrs, dst_ptrs, lengths, err_reqs
 
+    async def _send_layer_kv_push(
+        self,
+        send_meta: SendBlockMeta,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        block_ids: list[int],
+    ) -> bool:
+        """
+        Push mode: Send single layer KV to Consumer.
+        D's address is already in send_meta (obtained from ZMQ message in start_load_kv).
+
+        Args:
+            send_meta: Send metadata (contains D's address and base_addr)
+            layer_name: Layer name
+            kv_layer: KV cache tensor for this layer
+            block_ids: Block IDs to transfer
+
+        Returns:
+            bool: Whether transfer succeeded
+        """
+        # 1. Calculate layer index
+        layer_names = list(self.device_kv_caches.keys())
+        if layer_name not in layer_names:
+            logger.error("Layer %s not found in device_kv_caches", layer_name)
+            return False
+        layer_idx = layer_names.index(layer_name)
+
+        # 2. Build transfer params (only this layer)
+        src_ptrs, dst_ptrs, lengths = self._build_layer_transfer_params_push(
+            send_meta, layer_idx, block_ids
+        )
+
+        if not src_ptrs:
+            return False
+
+        # 3. Wait for CUDA computation to complete # TODO wdb: 这里是必要的吗？
+        stream = torch.cuda.current_stream()
+        event = torch.cuda.Event()
+        event.record(stream)
+        event.synchronize()  # Ensure layer computation is done
+
+        # 4. Execute Mooncake transfer
+        remote_session = f"{send_meta.remote_hostname}:{send_meta.remote_port}"
+
+        ret_value = await self.sender_loop.run_in_executor(
+            self._sender_executor,
+            self._send_blocks,
+            remote_session,
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+        )
+
+        if ret_value != 0:
+            logger.error(
+                "Failed to send layer %s to %s: ret=%d",
+                layer_name, remote_session, ret_value
+            )
+            return False
+
+        # 5. Send notification to Consumer that layer is ready
+        if send_meta.remote_notify_port > 0:
+            try:
+                notify_addr = f"tcp://{send_meta.remote_hostname}:{send_meta.remote_notify_port}"
+                notify_sock = self.async_zmq_ctx.socket(zmq.PUSH)
+                notify_sock.connect(notify_addr)
+                notify_sock.send_json({
+                    "transfer_id": send_meta.transfer_id,
+                    "layer_name": layer_name,
+                })
+                notify_sock.close()
+                logger.debug(
+                    "Sent layer completion notification for %s to %s",
+                    layer_name, notify_addr
+                )
+            except Exception as e:
+                logger.warning("Failed to send layer notification: %s", e)
+                # Continue even if notification fails - data is already transferred
+
+        return True
+
     def _send_blocks(
         self,
         remote_session: str,
@@ -911,6 +1182,66 @@ class MooncakeConnectorWorker:
                 time.perf_counter() - start_time,
             )
         return ret_value
+
+    def _build_layer_transfer_params_push(
+        self,
+        send_meta: SendBlockMeta,
+        layer_idx: int,
+        block_ids: list[int],
+    ) -> tuple[list[int], list[int], list[int]]:
+        """
+        Build transfer parameters for a single layer.
+
+        Args:
+            send_meta: Send metadata containing remote address info
+            layer_idx: Index of the layer to transfer
+            block_ids: Local block IDs to transfer
+
+        Returns:
+            Tuple of (src_ptrs, dst_ptrs, lengths)
+        """
+        src_ptrs = []
+        dst_ptrs = []
+        lengths = []
+
+        if not block_ids:
+            return src_ptrs, dst_ptrs, lengths
+
+        # Get base addresses for this layer
+        if layer_idx >= len(self.kv_caches_base_addr):
+            logger.error("Layer index %d out of range", layer_idx)
+            return src_ptrs, dst_ptrs, lengths
+
+        local_base_addr = self.kv_caches_base_addr[layer_idx:layer_idx+1]
+        remote_base_addr = send_meta.remote_kv_caches_base_addr[layer_idx:layer_idx+1] if send_meta.remote_kv_caches_base_addr else []
+
+        if not remote_base_addr:
+            logger.error("No remote base address for layer %d", layer_idx)
+            return src_ptrs, dst_ptrs, lengths
+
+        block_len = self.block_len
+
+        # Group contiguous blocks
+        group_local_block_ids = []
+        if len(block_ids) > 0:
+            start = block_ids[0]
+            curr_group = [start]
+            for i in range(1, len(block_ids)):
+                if block_ids[i] == block_ids[i-1] + 1:
+                    curr_group.append(block_ids[i])
+                else:
+                    group_local_block_ids.append(curr_group)
+                    curr_group = [block_ids[i]]
+            group_local_block_ids.append(curr_group)
+
+        # For layer-wise transfer, remote and local block IDs are the same
+        for group in group_local_block_ids:
+            for local_layer_addr, remote_layer_addr in zip(local_base_addr, remote_base_addr):
+                src_ptrs.append(local_layer_addr + group[0] * block_len)
+                dst_ptrs.append(remote_layer_addr + group[0] * block_len)
+                lengths.append(block_len * len(group))
+
+        return src_ptrs, dst_ptrs, lengths
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
@@ -973,6 +1304,39 @@ class MooncakeConnectorWorker:
             self._mooncake_sender_listener(ready_event), self.sender_loop
         )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
+
+    async def wait_for_layer_load_async(self, layer_name: str) -> None:
+        """
+        Push mode: Consumer side waits for specified layer to complete.
+
+        Flow:
+        1. Check if this layer is already received (layer_progress[layer_name])
+        2. If completed, return immediately
+        3. If not completed, create asyncio.Event and wait
+        4. Background receive thread will set event when this layer arrives
+        """
+        for pull_metas in self.reqs_to_recv.values():
+            for req_id, pull_meta in pull_metas.items():
+                # Check if already completed
+                if pull_meta.layer_progress.get(layer_name, False):
+                    continue
+
+                # Create wait event for this layer (if not exists)
+                if layer_name not in pull_meta.layer_events:
+                    pull_meta.layer_events[layer_name] = asyncio.Event()
+
+                # Wait for this layer to arrive
+                try:
+                    await asyncio.wait_for(
+                        pull_meta.layer_events[layer_name].wait(),
+                        timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Timeout waiting for layer %s of req %s",
+                        layer_name, req_id
+                    )
+                    raise
 
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
@@ -1045,17 +1409,51 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         req_ids = set(pull_metas)
-        metadata = MooncakeXferMetadata(
-            remote_hostname=self.hostname,
-            remote_port=self.rpc_port,
-            remote_tp_size=self.tp_size,
-            remote_tp_rank=self.tp_rank,
-            req_blocks={
+
+        # Build metadata
+        meta_kwargs = {
+            "remote_hostname": self.hostname,
+            "remote_port": self.rpc_port,
+            "remote_tp_size": self.tp_size,
+            "remote_tp_rank": self.tp_rank,
+            "req_blocks": {
                 req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
                 for req_id, pull_meta in pull_metas.items()
             },
-            kv_caches_base_addr=self.kv_caches_base_addr,
-        )
+            "kv_caches_base_addr": self.kv_caches_base_addr,
+        }
+
+        # For layer-wise mode, include layer information
+        if self.layer_wise_mode and self.device_kv_caches:
+            layer_names = list(self.device_kv_caches.keys())
+            meta_kwargs["total_layers"] = len(layer_names)
+            meta_kwargs["layer_names"] = layer_names
+
+            # Wait for notification listener to be ready (if it's starting)
+            # This avoids race condition where port is used before being bound
+            notify_port = getattr(self, 'layer_notify_port', 0)
+            if notify_port == 0 and hasattr(self, '_layer_notify_t'):
+                # Wait a bit for the listener to bind the port
+                import time
+                for _ in range(100):  # Max 1 second wait
+                    notify_port = getattr(self, 'layer_notify_port', 0)
+                    if notify_port > 0:
+                        break
+                    time.sleep(0.01)
+
+            meta_kwargs["notify_port"] = notify_port
+
+            # Initialize layer tracking for each pull_meta
+            for pull_meta in pull_metas.values():
+                pull_meta.total_layers = len(layer_names)
+                pull_meta.layer_progress = {ln: False for ln in layer_names}
+
+            logger.debug(
+                "Layer-wise mode: Sending metadata with %d layers, notify_port=%d",
+                len(layer_names), notify_port
+            )
+
+        metadata = MooncakeXferMetadata(**meta_kwargs)
 
         encoded_data = self._encoder.encode(metadata)
         logger.debug(
@@ -1093,6 +1491,30 @@ class MooncakeConnectorWorker:
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
             return
+
+    def process_layer_received(self, layer_name: str, pull_metas: dict[ReqId, PullReqMeta]):
+        """
+        Mark a layer as received for all requests in pull_metas.
+        Called when a layer transfer completes (in Push mode).
+        """
+        for req_id, pull_meta in pull_metas.items():
+            if layer_name not in pull_meta.layer_progress:
+                pull_meta.layer_progress[layer_name] = True
+                pull_meta.completed_layers += 1
+
+                # Signal waiting coroutines
+                if layer_name in pull_meta.layer_events:
+                    pull_meta.layer_events[layer_name].set()
+
+                logger.debug(
+                    "Layer %s received for req %s (%d/%d)",
+                    layer_name, req_id, pull_meta.completed_layers, pull_meta.total_layers
+                )
+
+                # Check if all layers completed
+                if pull_meta.completed_layers >= pull_meta.total_layers:
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    logger.info("Finished receiving all layers for req %s", req_id)
 
     def process_pulling_result(
         self,
@@ -1201,7 +1623,71 @@ class MooncakeConnectorWorker:
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
 
-    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata): # TODO: 原本所有的kvlayer信息都存放在这里了？
+    async def save_kv_layer_async(
+        self,
+        metadata: MooncakeConnectorMetadata,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ):
+        """
+        Producer side: Send the KV layer immediately after computation completes.
+        Push mode: D's address was obtained during start_load_kv, send directly.
+
+        Flow:
+        1. Check if this layer's request is in reqs_need_send
+        2. Wait for D side ready (ready event)
+        3. Wait for layer computation to complete (CUDA synchronize)
+        4. Call Mooncake to send this layer
+        5. Update layer_progress, clean up if all layers completed
+        """
+        if not metadata.reqs_to_send:
+            return
+
+        for req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
+            if transfer_id not in self.reqs_need_send:
+                continue
+
+            send_meta = self.reqs_need_send[transfer_id]
+
+            # 1. Wait for D side ready (first time needs to wait for ZMQ handshake)
+            if not send_meta.ready.is_set():
+                try:
+                    await asyncio.wait_for(
+                        send_meta.ready.wait(),
+                        timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for D side ready for req %s", req_id)
+                    continue
+
+            # 2. Check if this layer already sent (idempotency)
+            if send_meta.layer_progress.get(layer_name, False):
+                continue
+
+            # 3. Execute layer transfer
+            success = await self._send_layer_kv_push(
+                send_meta, layer_name, kv_layer, block_ids
+            )
+
+            if success:
+                # 4. Update progress
+                send_meta.layer_progress[layer_name] = True
+                send_meta.completed_layers += 1
+
+                logger.debug(
+                    "Sent layer %s for req %s (%d/%d)",
+                    layer_name, req_id, send_meta.completed_layers, send_meta.total_layers
+                )
+
+                # 5. Check if all layers completed
+                if send_meta.completed_layers >= send_meta.total_layers:
+                    del self.reqs_need_send[transfer_id]
+                    self.finished_sending_reqs.add(send_meta.p_req_id)
+                    logger.info("Finished sending all layers for req %s", req_id)
+
+    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
@@ -1218,6 +1704,9 @@ class MooncakeConnectorWorker:
                 # This may be already created by send_kv_to_decode()
                 # when D is sending MooncakeXferMetadata.
                 if transfer_id not in self.reqs_need_send:
+                    # In layer-wise mode, we need to wait for D's metadata
+                    # which contains layer tracking info, so we create a
+                    # placeholder here that will be filled by send_kv_to_decode
                     self.reqs_need_send[transfer_id] = SendBlockMeta(
                         p_req_id=p_req_id,
                         transfer_id=transfer_id,
