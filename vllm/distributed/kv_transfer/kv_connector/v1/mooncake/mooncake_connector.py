@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
 
 import httpx
 import msgspec
