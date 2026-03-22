@@ -310,10 +310,17 @@ class MooncakeConnector(KVConnectorBase_V1):
         if self.connector_worker.is_kv_consumer:
             return
 
+        # Record CUDA event in main thread (where computation happens)
+        # so that the sender_loop thread can synchronize on it later.
+        stream = torch.cuda.current_stream()
+        cuda_event = torch.cuda.Event()
+        cuda_event.record(stream)
+
         # Submit to worker's sender_loop
         asyncio.run_coroutine_threadsafe(
             self.connector_worker.save_kv_layer_async(
-                self._connector_metadata, layer_name, kv_layer, attn_metadata
+                self._connector_metadata, layer_name, kv_layer,
+                attn_metadata, cuda_event=cuda_event
             ),
             self.connector_worker.sender_loop
         )
@@ -427,10 +434,11 @@ class MooncakeConnectorScheduler:
         elif params.get("do_remote_decode"):
             assert not self.is_kv_consumer
             if not params.get("transfer_id"):
-                logger.warning("Missing transfer_id in kv_transfer_params from router!")
-            else:
-                # Add an empty list to worker to create event.
-                self._reqs_need_send[request.request_id] = (request, [])
+                logger.warning("Missing transfer_id in kv_transfer_params from router! Falling back to request_id.")
+                params["transfer_id"] = request.request_id
+            
+            # Add an empty list to worker to create event.
+            self._reqs_need_send[request.request_id] = (request, [])
 
     def build_connector_meta(
         self,
@@ -514,6 +522,16 @@ class MooncakeConnectorScheduler:
 
         if delay_free_blocks:
             self._reqs_need_send[request.request_id] = (request, block_ids)
+
+        if params.get("do_remote_decode"):
+            host, port = get_mooncake_bootstrap_addr(self.vllm_config)
+            return delay_free_blocks, dict(
+                do_remote_prefill=True,
+                do_remote_decode=False,
+                transfer_id=params.get("transfer_id", request.request_id),
+                remote_engine_id=self.engine_id,
+                remote_bootstrap_addr=f"{host}:{port}",
+            )
 
         return delay_free_blocks, None
 
@@ -619,14 +637,15 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.start()
             logger.debug("Mooncake Decoder: start receiver thread")
 
-            # For layer-wise mode, start a notification listener
+            # For layer-wise mode, start a notification listener on receiver_loop
+            # (must be on the same event loop as wait_for_layer_load_async to
+            # share asyncio.Event objects safely)
             if self.layer_wise_mode:
-                self._layer_notify_t = threading.Thread(
-                    target=self._layer_notification_listener,
-                    daemon=True,
+                self.layer_notify_port = 0  # Will be set once listener binds
+                asyncio.run_coroutine_threadsafe(
+                    self._layer_notification_loop(), self.receiver_loop
                 )
-                self._layer_notify_t.start()
-                logger.debug("Mooncake Decoder: start layer notification listener")
+                logger.debug("Mooncake Decoder: start layer notification listener on receiver_loop")
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
@@ -664,14 +683,8 @@ class MooncakeConnectorWorker:
     def __del__(self):
         self.shutdown()
 
-    def _layer_notification_listener(self):
-        """
-        Background thread on Consumer side to listen for layer completion notifications.
-        Producer sends a notification via ZMQ after each layer is transferred.
-        """
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self._layer_notification_loop())
+    # _layer_notification_listener removed: notification loop now runs
+    # directly on receiver_loop via asyncio.run_coroutine_threadsafe.
 
     async def _layer_notification_loop(self):
         """
@@ -696,7 +709,7 @@ class MooncakeConnectorWorker:
                     for pull_metas in self.reqs_to_recv.values():
                         for req_id, pull_meta in pull_metas.items():
                             if pull_meta.transfer_id == transfer_id:
-                                if layer_name not in pull_meta.layer_progress:
+                                if not pull_meta.layer_progress.get(layer_name, False):
                                     pull_meta.layer_progress[layer_name] = True
                                     pull_meta.completed_layers += 1
 
@@ -725,17 +738,19 @@ class MooncakeConnectorWorker:
                                         )
                                 found = True
                                 break
-                        if not found:
-                            # Possible race condition: notification arrived before 
-                            # _start_load_kv registered the metadata.
-                            # Log and continue - we might miss this notification 
-                            # but the wait_for_layer_load will timeout.
-                            # In production, we could buffer this early notification.
-                            logger.warning(
-                                "Received notification for unknown transfer_id %s. "
-                                "Possible race condition with metadata registration.",
-                                transfer_id
-                            )
+                        if found:
+                            break
+                    if not found:
+                        # Possible race condition: notification arrived before 
+                        # _start_load_kv registered the metadata.
+                        # Log and continue - we might miss this notification 
+                        # but the wait_for_layer_load will timeout.
+                        # In production, we could buffer this early notification.
+                        logger.warning(
+                            "Received notification for unknown transfer_id %s. "
+                            "Possible race condition with metadata registration.",
+                            transfer_id
+                        )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting layer notification listener.")
         except Exception as e:
@@ -757,11 +772,8 @@ class MooncakeConnectorWorker:
             if self.receiver_loop.is_running():
                 self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
                 self._mooncake_receiver_t.join()
-            # Stop layer notification listener if running
-            if self.layer_wise_mode and hasattr(self, '_layer_notify_t'):
-                # The notification listener uses ZMQ, which will be terminated
-                # by async_zmq_ctx.term() above, causing the listener to exit.
-                self._layer_notify_t.join(timeout=1.0)
+            # Layer notification listener runs on receiver_loop,
+            # it will be stopped when receiver_loop is stopped above.
             if hasattr(self, '_notify_socks'):
                 for sock in self._notify_socks.values():
                     sock.close()
@@ -1125,6 +1137,7 @@ class MooncakeConnectorWorker:
         layer_name: str,
         kv_layer: torch.Tensor,
         block_ids: list[int],
+        cuda_event: torch.cuda.Event | None = None,
     ) -> bool:
         """
         Push mode: Send single layer KV to Consumer.
@@ -1135,6 +1148,7 @@ class MooncakeConnectorWorker:
             layer_name: Layer name
             kv_layer: KV cache tensor for this layer
             block_ids: Block IDs to transfer
+            cuda_event: Pre-recorded CUDA event from the compute thread
 
         Returns:
             bool: Whether transfer succeeded
@@ -1154,11 +1168,14 @@ class MooncakeConnectorWorker:
         if not src_ptrs:
             return False
 
-        # 3. Wait for CUDA computation to complete # TODO wdb: 这里是必要的吗？
-        stream = torch.cuda.current_stream()
-        event = torch.cuda.Event()
-        event.record(stream)
-        event.synchronize()  # Ensure layer computation is done
+        # 3. Wait for CUDA computation to complete.
+        # The cuda_event was recorded on the compute stream in the main thread;
+        # synchronize here to ensure the layer's KV data is ready for transfer.
+        if cuda_event is not None:
+            cuda_event.synchronize()
+        else:
+            # Fallback: synchronize current stream (less precise)
+            torch.cuda.current_stream().synchronize()
 
         # 4. Execute Mooncake transfer
         remote_session = f"{send_meta.remote_hostname}:{send_meta.remote_port}"
@@ -1520,7 +1537,12 @@ class MooncakeConnectorWorker:
                             response.err_msg,
                         )
                         return
-                    self.process_pulling_result(response, pull_metas)
+                    # In layer-wise mode, don't process pulling result here.
+                    # Layers arrive via RDMA push + notification; the ZMQ response
+                    # from P side is just an ACK that P accepted the request, not
+                    # that data transfer is complete.
+                    if not self.layer_wise_mode:
+                        self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
                         break
         except zmq.ContextTerminated:
@@ -1535,7 +1557,7 @@ class MooncakeConnectorWorker:
         Called when a layer transfer completes (in Push mode).
         """
         for req_id, pull_meta in pull_metas.items():
-            if layer_name not in pull_meta.layer_progress:
+            if not pull_meta.layer_progress.get(layer_name, False):
                 pull_meta.layer_progress[layer_name] = True
                 pull_meta.completed_layers += 1
 
@@ -1715,9 +1737,11 @@ class MooncakeConnectorWorker:
             if send_meta.layer_progress.get(layer_name, False):
                 continue
 
-            # 3. Execute layer transfer
+            # 3. Execute layer transfer (pass CUDA event from main thread)
+            cuda_event = kwargs.get('cuda_event', None)
             success = await self._send_layer_kv_push(
-                send_meta, layer_name, kv_layer, block_ids
+                send_meta, layer_name, kv_layer, block_ids,
+                cuda_event=cuda_event
             )
 
             if success:
