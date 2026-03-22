@@ -579,6 +579,7 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
+        self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = {}
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -712,14 +713,28 @@ class MooncakeConnectorWorker:
                                     # Check if all layers completed
                                     if pull_meta.completed_layers >= pull_meta.total_layers:
                                         self.finished_recving_reqs.add(pull_meta.d_req_id)
+                                        # Clean up from local state once fully received
+                                        for engine_reqs in self.reqs_to_recv.values():
+                                            if req_id in engine_reqs:
+                                                del engine_reqs[req_id]
+                                                break
                                         logger.info(
                                             "Finished receiving all layers for req %s",
                                             req_id
                                         )
                                 found = True
                                 break
-                        if found:
-                            break
+                        if not found:
+                            # Possible race condition: notification arrived before 
+                            # _start_load_kv registered the metadata.
+                            # Log and continue - we might miss this notification 
+                            # but the wait_for_layer_load will timeout.
+                            # In production, we could buffer this early notification.
+                            logger.warning(
+                                "Received notification for unknown transfer_id %s. "
+                                "Possible race condition with metadata registration.",
+                                transfer_id
+                            )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting layer notification listener.")
         except Exception as e:
@@ -1535,6 +1550,11 @@ class MooncakeConnectorWorker:
                 # Check if all layers completed
                 if pull_meta.completed_layers >= pull_meta.total_layers:
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
+                    # Clean up from local state once fully received
+                    for engine_reqs in self.reqs_to_recv.values():
+                        if req_id in engine_reqs:
+                            del engine_reqs[req_id]
+                            break
                     logger.info("Finished receiving all layers for req %s", req_id)
 
     def process_pulling_result(
@@ -1636,6 +1656,13 @@ class MooncakeConnectorWorker:
     async def _start_load_kv(
         self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] # TODO wdb: call it after each layer forward
     ):
+        # For layer-wise mode, also save the reqs_to_recv to self for notification tracking
+        if self.layer_wise_mode:
+            for remote_engine_id, pull_metas in reqs_to_recv.items():
+                if remote_engine_id not in self.reqs_to_recv:
+                    self.reqs_to_recv[remote_engine_id] = {}
+                self.reqs_to_recv[remote_engine_id].update(pull_metas)
+
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -1707,6 +1734,12 @@ class MooncakeConnectorWorker:
                     del self.reqs_need_send[transfer_id]
                     self.finished_sending_reqs.add(send_meta.p_req_id)
                     logger.info("Finished sending all layers for req %s", req_id)
+            else:
+                # 6. Handle failure
+                logger.error("Failed to send layer %s for req %s. "
+                             "This request might be stranded.", layer_name, req_id)
+                # Mark as timed out so fetch_finished_sending_reqs cleans it up
+                send_meta.expire_time = time.perf_counter()
 
     async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
