@@ -2,16 +2,19 @@ import asyncio
 import aiohttp
 import time
 import argparse
+import uuid
 import numpy as np
 from tabulate import tabulate # 请先 pip install tabulate
 
-def generate_long_prompt(length):
-    # 粗略估计：1个token约等于4个字符，这里按字符构造
+def generate_long_prompt(length, unique_prefix=True):
+    # 加唯一前缀避免前缀缓存命中，确保每次真正做 prefill
+    prefix = f"[uid:{uuid.uuid4().hex}] " if unique_prefix else ""
     base_text = "The quick brown fox jumps over the lazy dog. "
-    return (base_text * (length // 10 + 1))[:length]
+    body = (base_text * (length // len(base_text) + 2))
+    return (prefix + body)[:length]
 
-async def measure_request(session, url, model_name, prompt_len):
-    prompt = generate_long_prompt(prompt_len)
+async def measure_request(session, url, model_name, prompt_len, semaphore, timeout=120):
+    prompt = generate_long_prompt(prompt_len, unique_prefix=True)
     payload = {
         "model": model_name,
         "prompt": prompt,
@@ -20,46 +23,56 @@ async def measure_request(session, url, model_name, prompt_len):
         "stream": True
     }
     
-    start_time = time.perf_counter()
-    ttft = None
-    last_token_time = None
-    tokens_received = 0
-    
-    try:
-        async with session.post(f"{url}/v1/completions", json=payload) as response:
-            async for line in response.content:
-                if line.startswith(b"data: "):
-                    content = line.decode('utf-8')
-                    if "[DONE]" in content:
-                        break
-                    
-                    tokens_received += 1
-                    current_time = time.perf_counter()
-                    
-                    if ttft is None:
-                        ttft = current_time - start_time
-                    last_token_time = current_time
+    async with semaphore:
+        start_time = time.perf_counter()
+        ttft = None
+        last_token_time = None
+        tokens_received = 0
         
-        e2e_latency = last_token_time - start_time
-        # TPOT = (总时间 - 首字时间) / (总token数 - 1)
-        tpot = (e2e_latency - ttft) / (tokens_received - 1) if tokens_received > 1 else 0
-        
-        return {
-            "ttft": ttft,
-            "tpot": tpot,
-            "e2e": e2e_latency,
-            "success": True
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+        try:
+            req_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with session.post(f"{url}/v1/completions", json=payload,
+                                    timeout=req_timeout) as response:
+                async for line in response.content:
+                    if line.startswith(b"data: "):
+                        content = line.decode('utf-8')
+                        if "[DONE]" in content:
+                            break
+                        
+                        tokens_received += 1
+                        current_time = time.perf_counter()
+                        
+                        if ttft is None:
+                            ttft = current_time - start_time
+                        last_token_time = current_time
+            
+            if ttft is None or last_token_time is None:
+                return {"success": False, "error": "no tokens received"}
+            
+            e2e_latency = last_token_time - start_time
+            # TPOT = (总时间 - 首字时间) / (总token数 - 1)
+            tpot = (e2e_latency - ttft) / (tokens_received - 1) if tokens_received > 1 else 0
+            
+            return {
+                "ttft": ttft,
+                "tpot": tpot,
+                "e2e": e2e_latency,
+                "success": True
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
 async def run_batch(url, model, length, n_requests, concurrency):
-    print(f"正在测试长度: {length} ...", end="\r")
+    print(f"正在测试长度: {length} ...", flush=True)
+    semaphore = asyncio.Semaphore(concurrency)
     async with aiohttp.ClientSession() as session:
-        tasks = [measure_request(session, url, model, length) for _ in range(n_requests)]
+        tasks = [measure_request(session, url, model, length, semaphore) for _ in range(n_requests)]
         results = await asyncio.gather(*tasks)
     
     valid_results = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+    if failed:
+        print(f"  [{length}] {len(failed)}/{len(results)} 请求失败，首个错误: {failed[0]['error']}", flush=True)
     if not valid_results:
         return None
     
