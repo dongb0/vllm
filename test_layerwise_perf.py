@@ -13,12 +13,12 @@ def generate_long_prompt(length, unique_prefix=True):
     body = (base_text * (length // len(base_text) + 2))
     return (prefix + body)[:length]
 
-async def measure_request(session, url, model_name, prompt_len, semaphore, timeout=120):
+async def measure_request(session, url, model_name, prompt_len, semaphore, timeout=30):
     prompt = generate_long_prompt(prompt_len, unique_prefix=True)
     payload = {
         "model": model_name,
         "prompt": prompt,
-        "max_tokens": 32, # 生成少量内容以减小 Decode 阶段干扰
+        "max_tokens": 32,
         "temperature": 0.0,
         "stream": True
     }
@@ -30,27 +30,33 @@ async def measure_request(session, url, model_name, prompt_len, semaphore, timeo
         tokens_received = 0
         
         try:
-            req_timeout = aiohttp.ClientTimeout(total=timeout)
-            async with session.post(f"{url}/v1/completions", json=payload,
-                                    timeout=req_timeout) as response:
-                async for line in response.content:
-                    if line.startswith(b"data: "):
-                        content = line.decode('utf-8')
-                        if "[DONE]" in content:
-                            break
-                        
-                        tokens_received += 1
-                        current_time = time.perf_counter()
-                        
-                        if ttft is None:
-                            ttft = current_time - start_time
-                        last_token_time = current_time
+            req_timeout = aiohttp.ClientTimeout(
+                total=timeout, sock_read=timeout
+            )
+
+            async def _do_stream():
+                nonlocal ttft, last_token_time, tokens_received
+                async with session.post(f"{url}/v1/completions", json=payload,
+                                        timeout=req_timeout) as response:
+                    async for line in response.content:
+                        if line.startswith(b"data: "):
+                            content = line.decode('utf-8')
+                            if "[DONE]" in content:
+                                return
+                            
+                            tokens_received += 1
+                            current_time = time.perf_counter()
+                            
+                            if ttft is None:
+                                ttft = current_time - start_time
+                            last_token_time = current_time
+
+            await asyncio.wait_for(_do_stream(), timeout=timeout)
             
             if ttft is None or last_token_time is None:
                 return {"success": False, "error": "no tokens received"}
             
             e2e_latency = last_token_time - start_time
-            # TPOT = (总时间 - 首字时间) / (总token数 - 1)
             tpot = (e2e_latency - ttft) / (tokens_received - 1) if tokens_received > 1 else 0
             
             return {
@@ -59,6 +65,8 @@ async def measure_request(session, url, model_name, prompt_len, semaphore, timeo
                 "e2e": e2e_latency,
                 "success": True
             }
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"timeout after {timeout}s (got {tokens_received} tokens)"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -91,7 +99,9 @@ async def main():
     args = parser.parse_args()
 
     # 测试配置
-    test_lengths = [1024, 4096, 16384, 32768]
+    # test_lengths = [1024, 4096, 16384, 24 * 1024, 32768]
+    # test_lengths = [1024, 4096, 16384, 24 * 1024, 32768]
+    test_lengths = [1024, 4096, 16384, 24 * 1024]
     n_requests = 10
     concurrency = 1 # 建议设为1以观察纯粹的传输开销，不被调度干扰
 

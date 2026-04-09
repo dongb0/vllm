@@ -3,9 +3,11 @@
 # --- 基础配置 ---
 LOG_DIR="$HOME/autodl-tmp/logs"
 # MODEL_PATH="$HOME/Qwen2.5-0.5B-Instruct"
-MODEL_PATH="$HOME/autodl-tmp"  ## 实际上是uQwen2.5-7B-Instruct
+# MODEL_PATH="$HOME/autodl-tmp"  ## 实际上是uQwen2.5-7B-Instruct
+MODEL_PATH="$HOME/autodl-tmp/Qwen1.5-7B"
 MODEL_NAME="Qwen2.5-0.5B-Instruct"
-MAX_LEN=32768
+# MAX_LEN=32768
+MAX_LEN=24576
 GPU_UTIL=0.9
 
 # 获取参数：on (开启 layer_wise), off (关闭), clean (仅清理)
@@ -38,10 +40,13 @@ fi
 cleanup
 mkdir -p "$LOG_DIR"
 
+# --- Mooncake TCP 连接池 (无 RDMA 环境必须开启，否则端口耗尽) ---
+export MC_TCP_ENABLE_CONNECTION_POOL=true
+
 # --- 3. 构造命令 (统一指定 GPU 0) ---
 
 # Prefiller 命令
-PREFILLER_CMD="CUDA_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_server \
+PREFILLER_CMD="CUDA_VISIBLE_DEVICES=0 MC_TCP_ENABLE_CONNECTION_POOL=true python3 -m vllm.entrypoints.openai.api_server \
     --port 8010 \
     --model $MODEL_PATH \
     --served-model-name $MODEL_NAME \
@@ -50,7 +55,7 @@ PREFILLER_CMD="CUDA_VISIBLE_DEVICES=0 python3 -m vllm.entrypoints.openai.api_ser
     --kv-transfer-config '{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\": {\"layer_wise\": $LAYER_WISE}}'"
 
 # Decoder 命令
-DECODER_CMD="CUDA_VISIBLE_DEVICES=1 python3 -m vllm.entrypoints.openai.api_server \
+DECODER_CMD="CUDA_VISIBLE_DEVICES=1 MC_TCP_ENABLE_CONNECTION_POOL=true python3 -m vllm.entrypoints.openai.api_server \
     --port 8020 \
     --model $MODEL_PATH \
     --served-model-name $MODEL_NAME \
@@ -73,8 +78,19 @@ echo -e "\033[1;33m[执行命令 - Decoder (GPU 0)]:\033[0m"
 echo -e "\033[32m$DECODER_CMD\033[0m\n"
 nohup sh -c "$DECODER_CMD" > "$LOG_DIR/decoder.log" 2>&1 &
 
-echo "等待服务初始化 (15s)..."
-sleep 15
+echo "等待服务初始化..."
+for i in $(seq 1 60); do
+    P=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8010/health 2>/dev/null)
+    D=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8020/health 2>/dev/null)
+    if [ "$P" = "200" ] && [ "$D" = "200" ]; then
+        echo "  服务就绪 (${i}s)"
+        break
+    fi
+    if [ "$i" = "60" ]; then
+        echo "  警告：等待超时(60s)，服务可能未就绪 (prefiller=$P decoder=$D)"
+    fi
+    sleep 1
+done
 
 echo -e "\033[1;33m[执行命令 - Proxy]:\033[0m"
 echo -e "\033[32m$PROXY_CMD\033[0m\n"
