@@ -5,10 +5,9 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any
-from dataclasses import dataclass, field
 
 import httpx
 import msgspec
@@ -79,7 +78,7 @@ class MooncakeXferMetadata(
     kv_caches_base_addr: list[int]
     # ===== Layer-wise transfer fields =====
     total_layers: int = 0  # Total number of layers for layer-wise transfer
-    layer_names: list[str] = field(default_factory=list)  # Layer names in order
+    layer_names: list[str] = []  # type: ignore[assignment]  # Layer names in order
     notify_port: int = 0  # Consumer's notification port for layer completion
 
 
@@ -600,6 +599,9 @@ class MooncakeConnectorWorker:
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = {}
+        # Buffer for early layer notifications that arrive before
+        # _start_load_kv registers the pull_meta (avoids lost notifications).
+        self._early_layer_notifications: list[dict] = []
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -705,59 +707,73 @@ class MooncakeConnectorWorker:
                 layer_name = msg.get("layer_name")
 
                 if transfer_id and layer_name:
-                    # Find the corresponding pull_meta and mark layer as received
-                    found = False
-                    for pull_metas in self.reqs_to_recv.values():
-                        for req_id, pull_meta in pull_metas.items():
-                            if pull_meta.transfer_id == transfer_id:
-                                if not pull_meta.layer_progress.get(layer_name, False):
-                                    pull_meta.layer_progress[layer_name] = True
-                                    pull_meta.completed_layers += 1
-
-                                    # Signal waiting coroutines
-                                    if layer_name in pull_meta.layer_events:
-                                        pull_meta.layer_events[layer_name].set()
-
-                                    logger.debug(
-                                        "Layer %s received for req %s (%d/%d)",
-                                        layer_name, req_id,
-                                        pull_meta.completed_layers,
-                                        pull_meta.total_layers
-                                    )
-
-                                    # Check if all layers completed
-                                    if pull_meta.completed_layers >= pull_meta.total_layers:
-                                        self.finished_recving_reqs.add(pull_meta.d_req_id)
-                                        # Clean up from local state once fully received
-                                        for engine_reqs in self.reqs_to_recv.values():
-                                            if req_id in engine_reqs:
-                                                del engine_reqs[req_id]
-                                                break
-                                        logger.info(
-                                            "Finished receiving all layers for req %s",
-                                            req_id
-                                        )
-                                found = True
-                                break
-                        if found:
-                            break
-                    if not found:
-                        # Possible race condition: notification arrived before 
-                        # _start_load_kv registered the metadata.
-                        # Log and continue - we might miss this notification 
-                        # but the wait_for_layer_load will timeout.
-                        # In production, we could buffer this early notification.
-                        logger.warning(
-                            "Received notification for unknown transfer_id %s. "
-                            "Possible race condition with metadata registration.",
-                            transfer_id
-                        )
+                    self._apply_layer_notification(transfer_id, layer_name)
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting layer notification listener.")
         except Exception as e:
             logger.error("Error in layer notification listener: %s", e)
         finally:
             sock.close()
+
+    def _apply_layer_notification(self, transfer_id: str, layer_name: str):
+        """
+        Apply a single layer notification. Finds the matching pull_meta by
+        transfer_id and marks the layer as received. If not found, buffers
+        the notification for later replay.
+        """
+        # Collect cleanup targets outside the iteration loop
+        cleanup_engine_id: EngineId | None = None
+        cleanup_req_id: ReqId | None = None
+
+        found = False
+        for engine_id, pull_metas in self.reqs_to_recv.items():
+            for req_id, pull_meta in pull_metas.items():
+                if pull_meta.transfer_id == transfer_id:
+                    if not pull_meta.layer_progress.get(layer_name, False):
+                        pull_meta.layer_progress[layer_name] = True
+                        pull_meta.completed_layers += 1
+
+                        # Signal waiting coroutines
+                        if layer_name in pull_meta.layer_events:
+                            pull_meta.layer_events[layer_name].set()
+
+                        logger.debug(
+                            "Layer %s received for req %s (%d/%d)",
+                            layer_name, req_id,
+                            pull_meta.completed_layers,
+                            pull_meta.total_layers
+                        )
+
+                        # Mark for cleanup after iteration
+                        if pull_meta.completed_layers >= pull_meta.total_layers:
+                            self.finished_recving_reqs.add(pull_meta.d_req_id)
+                            cleanup_engine_id = engine_id
+                            cleanup_req_id = req_id
+                            logger.info(
+                                "Finished receiving all layers for req %s",
+                                req_id
+                            )
+                    found = True
+                    break
+            if found:
+                break
+
+        # Perform cleanup outside the iteration
+        if cleanup_engine_id is not None and cleanup_req_id is not None:
+            engine_reqs = self.reqs_to_recv.get(cleanup_engine_id)
+            if engine_reqs and cleanup_req_id in engine_reqs:
+                del engine_reqs[cleanup_req_id]
+
+        if not found:
+            # Buffer early notification for later replay in _start_load_kv
+            self._early_layer_notifications.append({
+                "transfer_id": transfer_id,
+                "layer_name": layer_name,
+            })
+            logger.debug(
+                "Buffered early notification for transfer_id %s layer %s",
+                transfer_id, layer_name
+            )
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
@@ -773,11 +789,10 @@ class MooncakeConnectorWorker:
             if self.receiver_loop.is_running():
                 self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
                 self._mooncake_receiver_t.join()
-            # Layer notification listener runs on receiver_loop,
-            # it will be stopped when receiver_loop is stopped above.
-            if hasattr(self, '_notify_socks'):
-                for sock in self._notify_socks.values():
-                    sock.close()
+        # _notify_socks is initialized on the Producer side
+        if hasattr(self, '_notify_socks'):
+            for sock in self._notify_socks.values():
+                sock.close()
 
     async def register_worker_with_bootstrap(self):
         host, port = get_mooncake_bootstrap_addr(self.vllm_config)
@@ -1487,9 +1502,8 @@ class MooncakeConnectorWorker:
             # Wait for notification listener to be ready (if it's starting)
             # This avoids race condition where port is used before being bound
             notify_port = getattr(self, 'layer_notify_port', 0)
-            if notify_port == 0 and hasattr(self, '_layer_notify_t'):
-                # Wait a bit for the listener to bind the port
-                import time
+            if notify_port == 0 and self.layer_wise_mode:
+                # Wait for _layer_notification_loop to bind the port
                 for _ in range(100):  # Max 1 second wait
                     notify_port = getattr(self, 'layer_notify_port', 0)
                     if notify_port > 0:
@@ -1557,6 +1571,7 @@ class MooncakeConnectorWorker:
         Mark a layer as received for all requests in pull_metas.
         Called when a layer transfer completes (in Push mode).
         """
+        to_cleanup: list[ReqId] = []
         for req_id, pull_meta in pull_metas.items():
             if not pull_meta.layer_progress.get(layer_name, False):
                 pull_meta.layer_progress[layer_name] = True
@@ -1574,12 +1589,15 @@ class MooncakeConnectorWorker:
                 # Check if all layers completed
                 if pull_meta.completed_layers >= pull_meta.total_layers:
                     self.finished_recving_reqs.add(pull_meta.d_req_id)
-                    # Clean up from local state once fully received
-                    for engine_reqs in self.reqs_to_recv.values():
-                        if req_id in engine_reqs:
-                            del engine_reqs[req_id]
-                            break
+                    to_cleanup.append(req_id)
                     logger.info("Finished receiving all layers for req %s", req_id)
+
+        # Clean up completed requests outside the iteration loop
+        for req_id in to_cleanup:
+            for engine_reqs in self.reqs_to_recv.values():
+                if req_id in engine_reqs:
+                    del engine_reqs[req_id]
+                    break
 
     def process_pulling_result(
         self,
@@ -1687,6 +1705,15 @@ class MooncakeConnectorWorker:
                     self.reqs_to_recv[remote_engine_id] = {}
                 self.reqs_to_recv[remote_engine_id].update(pull_metas)
 
+            # Replay any early notifications that arrived before registration
+            if self._early_layer_notifications:
+                buffered = self._early_layer_notifications[:]
+                self._early_layer_notifications.clear()
+                for msg in buffered:
+                    self._apply_layer_notification(
+                        msg["transfer_id"], msg["layer_name"]
+                    )
+
         for remote_engine_id, pull_metas in reqs_to_recv.items():
             if remote_engine_id not in self._remote_agents:
                 asyncio.create_task(
@@ -1717,7 +1744,7 @@ class MooncakeConnectorWorker:
         if not metadata.reqs_to_send:
             return
 
-        for req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
+        for req_id, (transfer_id, _block_ids) in metadata.reqs_to_send.items():
             if transfer_id not in self.reqs_need_send:
                 continue
 
@@ -1736,6 +1763,27 @@ class MooncakeConnectorWorker:
 
             # 2. Check if this layer already sent (idempotency)
             if send_meta.layer_progress.get(layer_name, False):
+                continue
+
+            # Use the local block_ids from send_meta (set by record_send_reqs
+            # when request_finished provides real block IDs), instead of
+            # metadata.reqs_to_send which may be empty at forward time.
+            block_ids = send_meta.local_block_ids
+            if not block_ids:
+                # Block IDs not ready yet (request_finished hasn't been called).
+                # Wait briefly for record_send_reqs to set them.
+                try:
+                    await asyncio.wait_for(
+                        send_meta.ready.wait(),
+                        timeout=envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                    )
+                    block_ids = send_meta.local_block_ids
+                except asyncio.TimeoutError:
+                    logger.warning("Timeout waiting for block_ids for req %s layer %s", req_id, layer_name)
+                    continue
+
+            if not block_ids:
+                logger.warning("No block_ids available for req %s layer %s, skipping", req_id, layer_name)
                 continue
 
             # 3. Execute layer transfer (pass CUDA event from main thread)
