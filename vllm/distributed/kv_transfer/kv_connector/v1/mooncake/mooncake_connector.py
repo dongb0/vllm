@@ -266,21 +266,32 @@ class MooncakeConnector(KVConnectorBase_V1):
         - This function checks and waits for this layer to complete
         """
         if not self.layer_wise_mode:
-            # Old mode: no operation (bulk transfer done in start_load_kv)
             return
 
         assert self.connector_worker is not None
 
-        # Only consumer waits for layer load
         if self.connector_worker.is_kv_producer:
             return
 
-        # Synchronously wait for this layer to complete
+        # Only wait when this step actually has new recv requests.
+        # Without this guard, a pure decode step would scan the worker's
+        # global reqs_to_recv and block on an unrelated request that is
+        # still being loaded in the background.
+        metadata = self._connector_metadata
+        if not isinstance(metadata, MooncakeConnectorMetadata):
+            return
+        current_recv_req_ids: set[str] = set()
+        for pull_metas in metadata.reqs_to_recv.values():
+            current_recv_req_ids.update(pull_metas.keys())
+        if not current_recv_req_ids:
+            return
+
         future = asyncio.run_coroutine_threadsafe(
-            self.connector_worker.wait_for_layer_load_async(layer_name),
+            self.connector_worker.wait_for_layer_load_async(
+                layer_name, current_recv_req_ids),
             self.connector_worker.receiver_loop
         )
-        future.result()  # Block until this layer completes
+        future.result()
 
     def save_kv_layer(
         self,
@@ -721,7 +732,6 @@ class MooncakeConnectorWorker:
         transfer_id and marks the layer as received. If not found, buffers
         the notification for later replay.
         """
-        # Collect cleanup targets outside the iteration loop
         cleanup_engine_id: EngineId | None = None
         cleanup_req_id: ReqId | None = None
 
@@ -1293,10 +1303,15 @@ class MooncakeConnectorWorker:
             return src_ptrs, dst_ptrs, lengths
 
         remote_block_ids = send_meta.remote_block_ids
-        if len(block_ids) != len(remote_block_ids):
-            logger.error("Local block count (%d) doesn't match remote block count (%d)", 
-                         len(block_ids), len(remote_block_ids))
+        num_local_blocks = len(block_ids)
+        num_remote_blocks = len(remote_block_ids)
+        if num_local_blocks < num_remote_blocks:
+            logger.error(
+                "Local block count (%d) less than remote block count (%d)",
+                num_local_blocks, num_remote_blocks)
             return src_ptrs, dst_ptrs, lengths
+        if num_local_blocks > num_remote_blocks:
+            block_ids = block_ids[-num_remote_blocks:]
 
         block_len = self.block_len
 
@@ -1375,27 +1390,23 @@ class MooncakeConnectorWorker:
         )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
 
-    async def wait_for_layer_load_async(self, layer_name: str) -> None:
-        """
-        Push mode: Consumer side waits for specified layer to complete.
-
-        Flow:
-        1. Check if this layer is already received (layer_progress[layer_name])
-        2. If completed, return immediately
-        3. If not completed, create asyncio.Event and wait
-        4. Background receive thread will set event when this layer arrives
-        """
+    async def wait_for_layer_load_async(
+        self,
+        layer_name: str,
+        target_req_ids: set[str] | None = None,
+    ) -> None:
         for pull_metas in self.reqs_to_recv.values():
             for req_id, pull_meta in pull_metas.items():
-                # Check if already completed
-                if pull_meta.layer_progress.get(layer_name, False):
+                if target_req_ids is not None and req_id not in target_req_ids:
                     continue
 
-                # Create wait event for this layer (if not exists)
+                already_done = pull_meta.layer_progress.get(layer_name, False)
+                if already_done:
+                    continue
+
                 if layer_name not in pull_meta.layer_events:
                     pull_meta.layer_events[layer_name] = asyncio.Event()
 
-                # Wait for this layer to arrive
                 try:
                     await asyncio.wait_for(
                         pull_meta.layer_events[layer_name].wait(),
@@ -1403,8 +1414,10 @@ class MooncakeConnectorWorker:
                     )
                 except asyncio.TimeoutError:
                     logger.error(
-                        "Timeout waiting for layer %s of req %s",
-                        layer_name, req_id
+                        "Timeout waiting for layer %s of req %s "
+                        "(completed %d/%d layers)",
+                        layer_name, req_id,
+                        pull_meta.completed_layers, pull_meta.total_layers
                     )
                     raise
 
@@ -1512,15 +1525,9 @@ class MooncakeConnectorWorker:
 
             meta_kwargs["notify_port"] = notify_port
 
-            # Initialize layer tracking for each pull_meta
             for pull_meta in pull_metas.values():
                 pull_meta.total_layers = len(layer_names)
                 pull_meta.layer_progress = {ln: False for ln in layer_names}
-
-            logger.debug(
-                "Layer-wise mode: Sending metadata with %d layers, notify_port=%d",
-                len(layer_names), notify_port
-            )
 
         metadata = MooncakeXferMetadata(**meta_kwargs)
 
@@ -1695,10 +1702,9 @@ class MooncakeConnectorWorker:
 
         self.receive_kv(remote_engine_id, pull_metas)
 
-    async def _start_load_kv( # TODO wdb: 我想统计一下计算和通信在重叠之后传输时间减少了多少；怎么统计？
-        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] # TODO wdb: call it after each layer forward
+    async def _start_load_kv(
+        self, reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]]
     ):
-        # For layer-wise mode, also save the reqs_to_recv to self for notification tracking
         if self.layer_wise_mode:
             for remote_engine_id, pull_metas in reqs_to_recv.items():
                 if remote_engine_id not in self.reqs_to_recv:
